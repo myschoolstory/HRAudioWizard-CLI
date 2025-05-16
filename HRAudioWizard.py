@@ -3,21 +3,15 @@ import scipy
 import librosa
 import pyaudio
 import soundfile as sf
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-                             QPushButton, QLabel, QFileDialog, QProgressBar, QComboBox,
-                             QCheckBox, QSpinBox, QListWidget, QGroupBox, QRadioButton,
-                             QMessageBox, QTabWidget)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
 import warnings
 import argparse
-import hashlib
 import os
-import base64
 import datetime
 from concurrent.futures import ThreadPoolExecutor
 import queue
 import sys
 import tqdm
+import traceback
 
 # Constants
 FFTSIZE = 2048
@@ -26,53 +20,6 @@ HOPSIZE = 1024
 CHUNK_SIZE = 4096  # Increased for better frequency resolution
 SAMPLE_RATE = 44100
 HOPSIZE = CHUNK_SIZE // 4
-
-class Authed:
-    auth_mode = 1
-    authorized = -1
-    date = -1
-    licensekey = b""
-
-auth_info = Authed()
-
-def auth(licensefile):
-    try:
-        with open(licensefile, "r") as f:
-            license = f.read()
-    except FileNotFoundError:
-        return 0
-
-    key_1 = 55137268922164752821258604495339660756392940817231109643876377286678448710862
-    hash_expected = "3134ea1621834b9bbaf7ee7fb42b33677fb091a66252ce3d9c149f98aa87587a"
-
-    if hashlib.sha256(key_1.to_bytes(32, 'big')).hexdigest() != hash_expected:
-        print("ソフトが改造された可能性があります。作者へ連絡をください")
-        input("OK?")
-        sys.exit(0)
-
-    try:
-        dateval, hash_c = license.split(",")
-        authdate = int((int(dateval) ^ key_1) ** (1/8))
-
-        if authdate <= 1707513155:
-            auth_info.authorized = 0
-        else:
-            dt = datetime.datetime.fromtimestamp(authdate)
-            if hashlib.sha256(authdate.to_bytes(32, 'big')).hexdigest() == hash_c:
-                auth_info.date = dt
-                auth_info.authorized = 1
-                auth_info.licensekey = str(base64.b64encode(int(dateval).to_bytes(32, "big"))).replace("'", "")[1:]
-            else:
-                auth_info.authorized = 0
-    except:
-        auth_info.authorized = 0
-
-    if auth_info.auth_mode == 1 and auth_info.authorized == 0:
-        print("無効なライセンスファイルです")
-        input("OK?")
-        sys.exit(0)
-
-    return 0
 
 warnings.simplefilter('ignore')
 
@@ -349,142 +296,30 @@ def hfp(dat, lowpass, fs, compressd_mode=False, use_hpss=True):
     return np.array([iffted_mid+iffted_side, iffted_mid-iffted_side]).T
 
 
-class AudioProcessor(QThread):
-    error_occurred = pyqtSignal(str)
-
+class AudioProcessor:
     def __init__(self, input_device, output_device, settings):
-        super().__init__()
         self.input_device = input_device
         self.output_device = output_device
         self.settings = settings
         self.running = False
         self.audio_queue = queue.Queue(maxsize=10)
 
-    def run(self):
-        try:
-            p = pyaudio.PyAudio()
-            input_stream = p.open(format=pyaudio.paFloat32,
-                                  channels=2,
-                                  rate=SAMPLE_RATE,
-                                  input=True,
-                                  input_device_index=self.input_device,
-                                  frames_per_buffer=CHUNK_SIZE)
+    def process(self, file):
+        dat, fs = sf.read(file)
 
-            output_stream = p.open(format=pyaudio.paFloat32,
-                                   channels=2,
-                                   rate=SAMPLE_RATE,
-                                   output=True,
-                                   output_device_index=self.output_device,
-                                   frames_per_buffer=CHUNK_SIZE)
-
-            self.running = True
-            while self.running:
-                data = input_stream.read(CHUNK_SIZE)
-                audio_chunk = np.frombuffer(data, dtype=np.float32).reshape(-1, 2)
-
-                processed_chunk = self.process_audio(audio_chunk)
-
-                output_stream.write(processed_chunk.astype(np.float32).tobytes())
-
-        except Exception as e:
-            self.error_occurred.emit(str(e))
-        finally:
-            if 'input_stream' in locals():
-                input_stream.stop_stream()
-                input_stream.close()
-            if 'output_stream' in locals():
-                output_stream.stop_stream()
-                output_stream.close()
-            p.terminate()
-
-    def process_audio(self, audio_chunk):
-        if self.settings['high_freq_comp']:
-            audio_chunk = self.apply_hfc(audio_chunk)
         if self.settings['noise_reduction']:
-            audio_chunk = self.apply_noise_reduction(audio_chunk)
+            dat = decode(dat, 120)
         if self.settings['remaster']:
-            audio_chunk = self.apply_remaster(audio_chunk)
-        return audio_chunk
-
-    def apply_hfc(self, audio_chunk):
-        mid = (audio_chunk[:, 0] + audio_chunk[:, 1]) / 2
-        side = (audio_chunk[:, 0] - audio_chunk[:, 1]) / 2
-
-        mid_ffted = librosa.stft(mid, n_fft=CHUNK_SIZE, hop_length=HOPSIZE)
-        side_ffted = librosa.stft(side, n_fft=CHUNK_SIZE, hop_length=HOPSIZE)
-
-        mid_mag, mid_phase = librosa.magphase(mid_ffted)
-        side_mag, side_phase = librosa.magphase(side_ffted)
-
-        mid_hm, mid_pc = librosa.decompose.hpss(mid_mag, kernel_size=31, mask=True)
-        side_hm, side_pc = librosa.decompose.hpss(side_mag, kernel_size=31, mask=True)
-
-        # Simplified high frequency compensation
-        high_freq_boost = np.linspace(1, 2, mid_hm.shape[0])
-        mid_hm *= high_freq_boost[:, np.newaxis]
-        mid_pc *= high_freq_boost[:, np.newaxis]
-        side_hm *= high_freq_boost[:, np.newaxis]
-        side_pc *= high_freq_boost[:, np.newaxis]
-
-        mid_boosted = mid_hm * mid_phase + mid_pc * mid_phase
-        side_boosted = side_hm * side_phase + side_pc * side_phase
-
-        mid_boosted = librosa.istft(mid_boosted, hop_length=HOPSIZE)
-        side_boosted = librosa.istft(side_boosted, hop_length=HOPSIZE)
-
-        return np.column_stack((mid_boosted + side_boosted, mid_boosted - side_boosted))
-
-    def apply_noise_reduction(self, audio_chunk):
-        # Simplified noise reduction using spectral gating
-        mid = (audio_chunk[:, 0] + audio_chunk[:, 1]) / 2
-        side = (audio_chunk[:, 0] - audio_chunk[:, 1]) / 2
-
-        mid_ffted = librosa.stft(mid, n_fft=CHUNK_SIZE, hop_length=HOPSIZE)
-        side_ffted = librosa.stft(side, n_fft=CHUNK_SIZE, hop_length=HOPSIZE)
-
-        mid_mag, mid_phase = librosa.magphase(mid_ffted)
-        side_mag, side_phase = librosa.magphase(side_ffted)
-
-        # Simple spectral gating
-        threshold = np.mean(mid_mag) * 0.1
-        mid_mag[mid_mag < threshold] *= 0.1
-        side_mag[side_mag < threshold] *= 0.1
-
-        mid_reduced = mid_mag * mid_phase
-        side_reduced = side_mag * side_phase
-
-        mid_reduced = librosa.istft(mid_reduced, hop_length=HOPSIZE)
-        side_reduced = librosa.istft(side_reduced, hop_length=HOPSIZE)
-
-        return np.column_stack((mid_reduced + side_reduced, mid_reduced - side_reduced))
-
-    def apply_remaster(self, audio_chunk):
-        mid = (audio_chunk[:, 0] + audio_chunk[:, 1]) / 2
-        side = (audio_chunk[:, 0] - audio_chunk[:, 1]) / 2
-
-        mid_ffted = librosa.stft(mid, n_fft=CHUNK_SIZE, hop_length=HOPSIZE)
-        side_ffted = librosa.stft(side, n_fft=CHUNK_SIZE, hop_length=HOPSIZE)
-
-        mid_mag, mid_phase = librosa.magphase(mid_ffted)
-        side_mag, side_phase = librosa.magphase(side_ffted)
-
-        # Simplified remastering: enhance bass and treble
-        freq_boost = np.concatenate([np.linspace(1.5, 1, mid_mag.shape[0]//4),
-                                     np.ones(mid_mag.shape[0]//2),
-                                     np.linspace(1, 1.5, mid_mag.shape[0]//4)])
-        mid_mag *= freq_boost[:, np.newaxis]
-        side_mag *= freq_boost[:, np.newaxis]
-
-        mid_remastered = mid_mag * mid_phase
-        side_remastered = side_mag * side_phase
-
-        mid_remastered = librosa.istft(mid_remastered, hop_length=HOPSIZE)
-        side_remastered = librosa.istft(side_remastered, hop_length=HOPSIZE)
-
-        return np.column_stack((mid_remastered + side_remastered, mid_remastered - side_remastered))
-
-    def stop(self):
-        self.running = False
+            dat = remaster(dat, fs, self.settings['scale'])
+        elif self.settings['scale'] != 1:
+            dat = remaster(dat, fs, self.settings['scale'])
+        if self.settings['high_freq_comp']:
+            dat = hfp(dat, self.settings['lowpass'], fs * self.settings['scale'],
+                      compressd_mode=self.settings['compressed_mode'])
+        output_file = f"{os.path.splitext(file)[0]}_converted.wav"
+        sf.write(output_file, dat, fs * self.settings['scale'],
+                 format="WAV", subtype=f"PCM_{self.settings['bit_depth']}")
+        return output_file
 
 def hfp_2(dat, fs):
     fft_size = FFTSIZE
@@ -644,355 +479,89 @@ def decode(dat, bit):
 
     return np.array([mid+side, mid-side]).T
 
-class AudioConversionThread(QThread):
-    progress_updated = pyqtSignal(int, int)
-    conversion_complete = pyqtSignal()
-    file_converted = pyqtSignal(str)
-
-    def __init__(self, files, settings):
-        super().__init__()
-        self.files = files
-        self.settings = settings
-
-    def run(self):
-        total_files = len(self.files)
-        for i, file in enumerate(self.files):
-            self.convert_file(file)
-            self.file_converted.emit(file)
-            overall_progress = int((i + 1) / total_files * 100)
-            self.progress_updated.emit(100, overall_progress)
-        self.conversion_complete.emit()
-
-    def convert_file(self, file):
-        dat, fs = sf.read(file)
-
-        if self.settings['noise_reduction']:
-            dat = decode(dat, 120)
-
-        if self.settings['remaster']:
-            dat = remaster(dat, fs, self.settings['scale'])
-        elif self.settings['scale'] != 1:
-            dat = remaster(dat, fs, self.settings['scale'])
-
-        if self.settings['high_freq_comp']:
-            dat = hfp(dat, self.settings['lowpass'], fs * self.settings['scale'],
-                      compressd_mode=self.settings['compressed_mode'])
-
-        output_file = f"{os.path.splitext(file)[0]}_converted.wav"
-        sf.write(output_file, dat, fs * self.settings['scale'],
-                 format="WAV", subtype=f"PCM_{self.settings['bit_depth']}")
-
-        for progress in range(101):
-            self.progress_updated.emit(progress, 0)
-            self.msleep(10)
-
-class HRAudioWizard(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.initUI()
-        self.audio_processor = None
-
-    def initUI(self):
-        self.setWindowTitle('HRAudioWizard')
-        self.setGeometry(100, 100, 800, 600)
-
-        main_widget = QWidget()
-        main_layout = QVBoxLayout()
-        main_widget.setLayout(main_layout)
-        self.setCentralWidget(main_widget)
-
-        # Create tabs
-        tabs = QTabWidget()
-        main_layout.addWidget(tabs)
-
-        # Offline processing tab
-        offline_tab = QWidget()
-        offline_layout = QVBoxLayout()
-        offline_tab.setLayout(offline_layout)
-        tabs.addTab(offline_tab, "Offline Processing")
-
-        # File selection
-        file_group = QGroupBox("File Selection")
-        file_layout = QVBoxLayout()
-        self.file_list = QListWidget()
-        add_file_btn = QPushButton("Add Files")
-        add_file_btn.clicked.connect(self.add_files)
-        file_layout.addWidget(self.file_list)
-        file_layout.addWidget(add_file_btn)
-        file_group.setLayout(file_layout)
-        offline_layout.addWidget(file_group)
-
-        # Conversion settings
-        settings_group = QGroupBox("Conversion Settings")
-        settings_layout = QVBoxLayout()
-
-        # Bit depth
-        bit_depth_layout = QHBoxLayout()
-        bit_depth_layout.addWidget(QLabel("Bit Depth:"))
-        self.bit_depth_24 = QRadioButton("24-bit")
-        self.bit_depth_32 = QRadioButton("32-bit")
-        self.bit_depth_64 = QRadioButton("64-bit")
-        self.bit_depth_24.setChecked(True)
-        bit_depth_layout.addWidget(self.bit_depth_24)
-        bit_depth_layout.addWidget(self.bit_depth_32)
-        bit_depth_layout.addWidget(self.bit_depth_64)
-        settings_layout.addLayout(bit_depth_layout)
-
-        # Sampling rate
-        sampling_rate_layout = QHBoxLayout()
-        sampling_rate_layout.addWidget(QLabel("Sampling Rate:"))
-        self.sampling_rate = QComboBox()
-        self.sampling_rate.addItems(["x1", "x2", "x4", "x8"])
-        sampling_rate_layout.addWidget(self.sampling_rate)
-        settings_layout.addLayout(sampling_rate_layout)
-
-        # Checkboxes
-        self.remaster_cb = QCheckBox("Remaster")
-        self.noise_reduction_cb = QCheckBox("Noise Reduction")
-        self.high_freq_comp_cb = QCheckBox("High Frequency Compensation")
-        self.compressed_mode_cb = QCheckBox("Compressed Source Mode")
-        settings_layout.addWidget(self.remaster_cb)
-        settings_layout.addWidget(self.noise_reduction_cb)
-        settings_layout.addWidget(self.high_freq_comp_cb)
-        settings_layout.addWidget(self.compressed_mode_cb)
-
-        # Lowpass filter
-        lowpass_layout = QHBoxLayout()
-        lowpass_layout.addWidget(QLabel("Lowpass Filter (Hz):"))
-        self.lowpass_filter = QSpinBox()
-        self.lowpass_filter.setRange(4000, 50000)
-        self.lowpass_filter.setSingleStep(1000)
-        self.lowpass_filter.setValue(16000)
-        lowpass_layout.addWidget(self.lowpass_filter)
-        settings_layout.addLayout(lowpass_layout)
-
-        settings_group.setLayout(settings_layout)
-        offline_layout.addWidget(settings_group)
-
-        # Conversion progress
-        progress_layout = QVBoxLayout()
-        self.current_file_label = QLabel("Current File: ")
-        progress_layout.addWidget(self.current_file_label)
-        self.file_progress_bar = QProgressBar()
-        progress_layout.addWidget(self.file_progress_bar)
-        self.overall_progress_bar = QProgressBar()
-        progress_layout.addWidget(self.overall_progress_bar)
-        offline_layout.addLayout(progress_layout)
-
-        # Conversion button
-        self.convert_btn = QPushButton("Start Conversion")
-        self.convert_btn.clicked.connect(self.start_conversion)
-        offline_layout.addWidget(self.convert_btn)
-
-        # Realtime processing tab
-        realtime_tab = QWidget()
-        realtime_layout = QVBoxLayout()
-        realtime_tab.setLayout(realtime_layout)
-        tabs.addTab(realtime_tab, "Realtime Processing")
-
-        # Input device selection
-        input_layout = QHBoxLayout()
-        input_layout.addWidget(QLabel("Input Device:"))
-        self.input_device_combo = QComboBox()
-        input_layout.addWidget(self.input_device_combo)
-        realtime_layout.addLayout(input_layout)
-
-        # Output device selection
-        output_layout = QHBoxLayout()
-        output_layout.addWidget(QLabel("Output Device:"))
-        self.output_device_combo = QComboBox()
-        output_layout.addWidget(self.output_device_combo)
-        realtime_layout.addLayout(output_layout)
-
-        # Realtime processing options
-        self.realtime_hfc_checkbox = QCheckBox("High Frequency Compensation")
-        self.realtime_noise_reduction_checkbox = QCheckBox("Noise Reduction")
-        self.realtime_remaster_checkbox = QCheckBox("Remaster")
-        realtime_layout.addWidget(self.realtime_hfc_checkbox)
-        realtime_layout.addWidget(self.realtime_noise_reduction_checkbox)
-        realtime_layout.addWidget(self.realtime_remaster_checkbox)
-
-        # Start/Stop button
-        self.toggle_button = QPushButton("Start Processing")
-        self.toggle_button.clicked.connect(self.toggle_processing)
-        realtime_layout.addWidget(self.toggle_button)
-
-        # Auth info button
-        auth_info_btn = QPushButton("Show Auth Info")
-        auth_info_btn.clicked.connect(self.show_auth_info)
-        main_layout.addWidget(auth_info_btn)
-
-        self.populate_audio_devices()
-
-    def add_files(self):
-        files, _ = QFileDialog.getOpenFileNames(self, "Select audio files", "", "WAV Files (*.wav)")
-        self.file_list.addItems(files)
-
-    def start_conversion(self):
-        files = [self.file_list.item(i).text() for i in range(self.file_list.count())]
-        if not files:
-            QMessageBox.warning(self, "No Files", "Please add files to convert.")
-            return
-
-        settings = {
-            'bit_depth': 24 if self.bit_depth_24.isChecked() else (32 if self.bit_depth_32.isChecked() else 64),
-            'scale': int(self.sampling_rate.currentText()[1:]),
-            'remaster': self.remaster_cb.isChecked(),
-            'noise_reduction': self.noise_reduction_cb.isChecked(),
-            'high_freq_comp': self.high_freq_comp_cb.isChecked(),
-            'compressed_mode': self.compressed_mode_cb.isChecked(),
-            'lowpass': self.lowpass_filter.value()
-        }
-
-        self.conversion_thread = AudioConversionThread(files, settings)
-        self.conversion_thread.progress_updated.connect(self.update_progress)
-        self.conversion_thread.conversion_complete.connect(self.conversion_finished)
-        self.conversion_thread.file_converted.connect(self.file_converted)
-
-        # Disable UI elements
-        self.convert_btn.setEnabled(False)
-        self.file_list.setEnabled(False)
-        self.set_settings_enabled(False)
-
-        self.conversion_thread.start()
-
-    def update_progress(self, file_progress, overall_progress):
-        self.file_progress_bar.setValue(file_progress)
-        self.overall_progress_bar.setValue(overall_progress)
-
-    def file_converted(self, file):
-        self.current_file_label.setText(f"Current File: {os.path.basename(file)}")
-        self.file_list.takeItem(0)
-
-    def conversion_finished(self):
-        self.file_progress_bar.setValue(100)
-        self.overall_progress_bar.setValue(100)
-        self.current_file_label.setText("Conversion Complete")
-
-        # Re-enable UI elements
-        self.convert_btn.setEnabled(True)
-        self.file_list.setEnabled(True)
-        self.set_settings_enabled(True)
-
-        QMessageBox.information(self, "Conversion Complete", "All files have been converted successfully.")
-
-    def set_settings_enabled(self, enabled):
-        self.bit_depth_24.setEnabled(enabled)
-        self.bit_depth_32.setEnabled(enabled)
-        self.bit_depth_64.setEnabled(enabled)
-        self.sampling_rate.setEnabled(enabled)
-        self.remaster_cb.setEnabled(enabled)
-        self.noise_reduction_cb.setEnabled(enabled)
-        self.high_freq_comp_cb.setEnabled(enabled)
-        self.compressed_mode_cb.setEnabled(enabled)
-        self.lowpass_filter.setEnabled(enabled)
-
-    def populate_audio_devices(self):
-        p = pyaudio.PyAudio()
-        for i in range(p.get_device_count()):
-            dev_info = p.get_device_info_by_index(i)
-            self.input_device_combo.addItem(dev_info['name'], i)
-            self.output_device_combo.addItem(dev_info['name'], i)
-        p.terminate()
-
-    def toggle_processing(self):
-        if self.audio_processor is None or not self.audio_processor.running:
-            self.start_processing()
+def prompt_with_default(prompt, default, cast_func=str, choices=None):
+    while True:
+        if choices:
+            prompt_str = f"{prompt} [{'/'.join(str(c) for c in choices)}] (default: {default}): "
         else:
-            self.stop_processing()
+            prompt_str = f"{prompt} (default: {default}): "
+        val = input(prompt_str).strip()
+        if not val:
+            return default
+        try:
+            val_cast = cast_func(val)
+            if choices and val_cast not in choices:
+                print(f"Please choose from {choices}.")
+                continue
+            return val_cast
+        except Exception:
+            print(f"Invalid input. Please enter a value of type {cast_func.__name__}.")
 
-    def start_processing(self):
-        input_device = self.input_device_combo.currentData()
-        output_device = self.output_device_combo.currentData()
-        settings = {
-            'high_freq_comp': self.realtime_hfc_checkbox.isChecked(),
-            'noise_reduction': self.realtime_noise_reduction_checkbox.isChecked(),
-            'remaster': self.realtime_remaster_checkbox.isChecked()
-        }
-        self.audio_processor = AudioProcessor(input_device, output_device, settings)
-        self.audio_processor.error_occurred.connect(self.handle_error)
-        self.audio_processor.start()
-        self.toggle_button.setText("Stop Processing")
 
-    def stop_processing(self):
-        if self.audio_processor:
-            self.audio_processor.stop()
-            self.audio_processor.wait()
-            self.audio_processor = None
-        self.toggle_button.setText("Start Processing")
+def interactive_main():
+    print("HRAudioWizard CLI - Interactive Mode\n")
+    # File selection
+    while True:
+        files = input("Enter input WAV file paths (comma-separated): ").strip()
+        file_list = [f.strip() for f in files.split(',') if f.strip()]
+        if file_list:
+            break
+        print("Please enter at least one file.")
 
-    def handle_error(self, error_msg):
-        QMessageBox.critical(self, "Error", f"An error occurred: {error_msg}")
-        self.stop_processing()
+    bit_depth = prompt_with_default("Output bit depth", 24, int, [24, 32, 64])
+    scale = prompt_with_default("Sampling rate scale (x1, x2, x4, x8)", 1, int, [1, 2, 4, 8])
+    remaster = prompt_with_default("Enable remastering? (y/n)", 'n', str.lower, ['y', 'n']) == 'y'
+    noise_reduction = prompt_with_default("Enable noise reduction? (y/n)", 'n', str.lower, ['y', 'n']) == 'y'
+    high_freq_comp = prompt_with_default("Enable high frequency compensation? (y/n)", 'n', str.lower, ['y', 'n']) == 'y'
+    compressed_mode = prompt_with_default("Enable compressed source mode? (y/n)", 'n', str.lower, ['y', 'n']) == 'y'
+    lowpass = prompt_with_default("Lowpass filter frequency (Hz)", 16000, int)
 
-    def show_auth_info(self):
-        info = ""
-        if auth_info.authorized == 1:
-            info = (f"Using the full version\n"
-                    f"Serial Number: {auth_info.licensekey}\n"
-                    f"Purchase Time: {auth_info.date.strftime('%Y/%m/%d %H:%M:%S')}")
-        elif auth_info.authorized == -1:
-            info = "Using the unlimited free version\nPlease visit the author's website to purchase."
-        elif auth_info.authorized == 0:
-            info = "Using the free trial version\nPlease visit the author's website to purchase."
+    class Args:
+        pass
+    args = Args()
+    args.files = file_list
+    args.bit_depth = bit_depth
+    args.scale = scale
+    args.remaster = remaster
+    args.noise_reduction = noise_reduction
+    args.high_freq_comp = high_freq_comp
+    args.compressed_mode = compressed_mode
+    args.lowpass = lowpass
 
-        QMessageBox.information(self, "Authorization Information", info)
+    main(args)
 
-    def closeEvent(self, event):
-        self.stop_processing()
-        event.accept()
-
-class AudioConversionThread(QThread):
-    progress_updated = pyqtSignal(int, int)
-    conversion_complete = pyqtSignal()
-    file_converted = pyqtSignal(str)
-
-    def __init__(self, files, settings):
-        super().__init__()
-        self.files = files
-        self.settings = settings
-
-    def run(self):
-        total_files = len(self.files)
-        for i, file in enumerate(self.files):
-            self.convert_file(file)
-            self.file_converted.emit(file)
-            overall_progress = int((i + 1) / total_files * 100)
-            self.progress_updated.emit(100, overall_progress)
-        self.conversion_complete.emit()
-
-    def convert_file(self, file):
-        dat, fs = sf.read(file)
-
-        if self.settings['noise_reduction']:
-            dat = decode(dat, 120)
-
-        if self.settings['remaster']:
-            dat = remaster(dat, fs, self.settings['scale'])
-        elif self.settings['scale'] != 1:
-            dat = remaster(dat, fs, self.settings['scale'])
-
-        if self.settings['high_freq_comp']:
-            dat = hfp(dat, self.settings['lowpass'], fs * self.settings['scale'],
-                      compressd_mode=self.settings['compressed_mode'])
-
-        output_file = f"{os.path.splitext(file)[0]}_converted.wav"
-        sf.write(output_file, dat, fs * self.settings['scale'],
-                 format="WAV", subtype=f"PCM_{self.settings['bit_depth']}")
-
-        for progress in range(101):
-            self.progress_updated.emit(progress, 0)
-            self.msleep(10)
+def main(args):
+    settings = {
+        'bit_depth': args.bit_depth,
+        'scale': args.scale,
+        'remaster': getattr(args, 'remaster', False),
+        'noise_reduction': getattr(args, 'noise_reduction', False),
+        'high_freq_comp': getattr(args, 'high_freq_comp', False),
+        'compressed_mode': getattr(args, 'compressed_mode', False),
+        'lowpass': getattr(args, 'lowpass', 16000),
+    }
+    processor = AudioProcessor(input_device=None, output_device=None, settings=settings)
+    for file in args.files:
+        print(f"Processing {file}...")
+        try:
+            output_file = processor.process(file)
+            print(f"Output written to: {output_file}")
+        except Exception as e:
+            print(f"Error processing {file}: {e}")
+            traceback.print_exc()
 
 if __name__ == '__main__':
-    app = QApplication(sys.argv)
-
-    # Load license
-    license_path = os.path.join(os.path.dirname(sys.argv[0]), "license.lc_hraw")
-    auth(license_path)
-
-    # Create and show the main window
-    ex = HRAudioWizard()
-    ex.show()
-
-    sys.exit(app.exec())
+    if len(sys.argv) == 1:
+        interactive_main()
+    else:
+        parser = argparse.ArgumentParser(description='HRAudioWizard CLI - High Resolution Audio Batch Processor')
+        parser.add_argument('files', nargs='+', help='Input WAV files to process')
+        parser.add_argument('--bit-depth', type=int, choices=[24, 32, 64], default=24, help='Output bit depth (24, 32, 64)')
+        parser.add_argument('--scale', type=int, choices=[1, 2, 4, 8], default=1, help='Sampling rate scale (x1, x2, x4, x8)')
+        parser.add_argument('--remaster', action='store_true', help='Enable remastering')
+        parser.add_argument('--noise-reduction', action='store_true', help='Enable noise reduction')
+        parser.add_argument('--high-freq-comp', action='store_true', help='Enable high frequency compensation')
+        parser.add_argument('--compressed-mode', action='store_true', help='Enable compressed source mode')
+        parser.add_argument('--lowpass', type=int, default=16000, help='Lowpass filter frequency (Hz)')
+        args = parser.parse_args()
+        main(args)

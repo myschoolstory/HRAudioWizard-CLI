@@ -3,5 +3,4 @@ scipy
 librosa
 pyaudio
 soundfile
-PyQt6
 tqdm
